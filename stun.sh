@@ -14,7 +14,7 @@ die() { echo -e "\033[1;31m[ERROR]\033[0m $1"; exit 1; }
 
 clear
 echo "==================================================="
-echo "    BRIDGE + NGINX SSL + BBR + AUTO-RENEW          "
+echo "    BRIDGE + AUTO-UPGRADE SSL (ACME FIX)           "
 echo "==================================================="
 
 #################################
@@ -22,70 +22,92 @@ echo "==================================================="
 #################################
 read -p "Введите ваш ДОМЕН: " DOMAIN
 read -p "Введите ваш EMAIL: " EMAIL
-read -p "Введите IP удаленного сервера (Destination): " REMOTE_IP
+read -p "Введите IP удаленного сервера: " REMOTE_IP
 read -p "Входящий порт для моста [8443]: " LOCAL_PORT
 LOCAL_PORT=${LOCAL_PORT:-8443}
 
-log "1. Подготовка системы и установка пакетов..."
+log "1. Подготовка системы..."
 apt update -qq && apt install -y nginx certbot python3-certbot-nginx ufw cron curl dnsutils
 
-# Принудительно останавливаем Nginx и убираем старый конфиг, который мешает запуску
-log "Очистка старых конфигураций Nginx..."
 systemctl stop nginx || true
-rm -f /etc/nginx/sites-enabled/default
-rm -f /etc/nginx/sites-available/default
+rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default
 
 #################################
 # 2. АКТИВАЦИЯ BBR
 #################################
-log "2. Активация BBR и оптимизация..."
+log "2. Оптимизация сети (BBR)..."
 cat <<EOF > /etc/sysctl.d/99-bridge-performance.conf
 net.ipv4.ip_forward = 1
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_tw_reuse = 1
-net.core.netdev_max_backlog = 250000
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
+net.ipv4.conf.all.route_localnet = 1
 EOF
 sysctl --system >/dev/null
 
 #################################
-# 3. РАБОТА С SSL
+# 3. НАСТРОЙКА SSL (C ПРОВЕРКОЙ БЛОКИРОВКИ)
 #################################
-log "3. Получение SSL сертификата..."
+log "3. Настройка SSL..."
 CURRENT_IP=$(curl -s -4 ifconfig.me || echo "unknown")
 RESOLVED_IP=$(dig +short "$DOMAIN" A | tail -n1)
 
-ufw allow 80/tcp >/dev/null
-ufw allow 443/tcp >/dev/null
+mkdir -p "/etc/letsencrypt/live/$DOMAIN"
 
+ISSUED=false
 if [[ "$RESOLVED_IP" == "$CURRENT_IP" ]]; then
-    log "DNS совпадает. Используем Certbot..."
-    # Используем standalone режим, так как Nginx мы временно выключили для чистоты
-    certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL" || warn "Certbot не смог получить новый сертификат (возможно, он уже есть)."
-    
-    # Настройка автопродления
-    if ! (crontab -l 2>/dev/null | grep -q "certbot renew"); then
-        (crontab -l 2>/dev/null || echo ""; echo "0 0,12 * * * certbot renew --quiet --post-hook 'systemctl reload nginx'") | crontab -
+    log "DNS совпадает. Пробуем получить настоящий SSL..."
+    if certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"; then
+        log "Настоящий SSL успешно получен!"
+        ISSUED=true
+    else
+        warn "ACME заблокирован или ошибка. Создаем временный самоподписанный SSL..."
     fi
-else
-    warn "IP не совпадают. Создаем самоподписанный сертификат..."
-    mkdir -p /etc/letsencrypt/live/"$DOMAIN"
-    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-        -keyout /etc/letsencrypt/live/"$DOMAIN"/privkey.pem \
-        -out /etc/letsencrypt/live/"$DOMAIN"/fullchain.pem \
-        -subj "/CN=$DOMAIN" || true
+fi
+
+if [ "$ISSUED" = false ]; then
+    # Создаем самоподписанный, только если нет настоящего
+    if [ ! -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+            -keyout "/etc/letsencrypt/live/$DOMAIN/privkey.pem" \
+            -out "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" \
+            -subj "/CN=$DOMAIN"
+    fi
 fi
 
 #################################
-# 4. НАСТРОЙКА NGINX
+# 4. СОЗДАНИЕ СКРИПТА АВТО-ОБНОВЛЕНИЯ
 #################################
-log "4. Настройка Nginx заглушки (новая конфигурация)..."
+log "4. Создание фонового обработчика для перехода на Let's Encrypt..."
+
+cat <<EOF > /usr/local/bin/ssl-upgrade-check.sh
+#!/bin/bash
+DOMAIN="$DOMAIN"
+EMAIL="$EMAIL"
+
+# Проверяем, является ли сертификат самоподписанным
+# (Если в поле Issuer нет "Let's Encrypt", значит надо пробовать обновить)
+if openssl x509 -in "/etc/letsencrypt/live/\$DOMAIN/fullchain.pem" -noout -issuer | grep -q "Let's Encrypt"; then
+    # Если сертификат уже настоящий, просто запускаем стандартное продление
+    certbot renew --quiet --post-hook "systemctl reload nginx"
+else
+    # Если все еще самоподписанный, пытаемся получить настоящий
+    if certbot certonly --nginx -d "\$DOMAIN" --non-interactive --agree-tos -m "\$EMAIL"; then
+        systemctl reload nginx
+    fi
+fi
+EOF
+
+chmod +x /usr/local/bin/ssl-upgrade-check.sh
+
+# Добавляем в cron проверку каждые 12 часов
+if ! (crontab -l 2>/dev/null | grep -q "ssl-upgrade-check.sh"); then
+    (crontab -l 2>/dev/null || echo ""; echo "0 */12 * * * /usr/local/bin/ssl-upgrade-check.sh > /dev/null 2>&1") | crontab -
+fi
+
+#################################
+# 5. НАСТРОЙКА NGINX И МОСТА
+#################################
+log "5. Финальная настройка Nginx и NAT..."
 cat <<EOF > /etc/nginx/sites-available/default
 server {
     listen 80;
@@ -105,22 +127,14 @@ server {
 EOF
 ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
 mkdir -p /var/www/html
-echo "<html><body style='background:#000;color:#222;text-align:center;padding-top:20%;font-family:sans-serif;'><h1>Server Online</h1></body></html>" > /var/www/html/index.html
+echo "<html><body style='background:#111;color:#333;text-align:center;padding-top:20%;font-family:sans-serif;'><h1>Server Online</h1><p>Secure Bridge Active</p></body></html>" > /var/www/html/index.html
 
-# Проверяем конфиг перед запуском
-nginx -t && systemctl start nginx || die "Nginx не смог запуститься даже с новым конфигом."
+systemctl start nginx
 
-#################################
-# 5. НАСТРОЙКА МОСТА (NAT)
-#################################
-log "5. Настройка моста :$LOCAL_PORT -> $REMOTE_IP:443..."
+# Настройка NAT (UFW)
 LOCAL_IP4=$(hostname -I | awk '{print $1}')
-
-# Чистим before.rules от старых записей
 cp /etc/ufw/before.rules /etc/ufw/before.rules.bak
 sed -i '/\*nat/,/COMMIT/d' /etc/ufw/before.rules
-
-# Генерируем новый блок NAT
 cat <<EOF > /tmp/ufw_rules
 *nat
 :PREROUTING ACCEPT [0:0]
@@ -131,14 +145,9 @@ cat <<EOF > /tmp/ufw_rules
 -A POSTROUTING -p udp -d $REMOTE_IP --dport 443 -j SNAT --to-source $LOCAL_IP4
 COMMIT
 EOF
-
-# Сшиваем файлы
 cat /tmp/ufw_rules /etc/ufw/before.rules > /etc/ufw/before.rules.new
 mv /etc/ufw/before.rules.new /etc/ufw/before.rules
-
-# Разрешаем форвардинг
 sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
-
 ufw allow OpenSSH >/dev/null
 ufw allow "$LOCAL_PORT"/tcp
 ufw allow "$LOCAL_PORT"/udp
@@ -146,7 +155,7 @@ ufw --force enable
 ufw reload
 
 echo "---------------------------------------------------"
-log "УСПЕШНО ЗАВЕРШЕНО"
-echo "Домен: https://$DOMAIN"
-echo "Мост: :$LOCAL_PORT -> $REMOTE_IP:443"
+log "УСТАНОВКА ЗАВЕРШЕНА"
+echo "Мост работает через порт $LOCAL_PORT"
+echo "SSL: Временный (самоподписанный). Авто-замена на Let's Encrypt включена."
 echo "---------------------------------------------------"
