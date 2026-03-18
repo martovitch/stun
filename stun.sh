@@ -70,15 +70,40 @@ fi
 #################################
 # 3. ПОЛУЧЕНИЕ И АВТОПРОДЛЕНИЕ SSL
 #################################
-log "3. Получение SSL сертификата для $DOMAIN..."
+log "3. Проверка и получение SSL сертификата..."
+
+# Узнаем текущий публичный IP этого сервера
+CURRENT_IP=$(curl -s https://ifconfig.me || echo "unknown")
+# Узнаем, куда указывает домен
+RESOLVED_IP=$(dig +short "$DOMAIN" | tail -n1)
+
+log "Ваш IP: $CURRENT_IP | IP домена $DOMAIN: $RESOLVED_IP"
+
+# Разрешаем порты для проверки
 ufw allow 80/tcp >/dev/null
 ufw allow 443/tcp >/dev/null
 
-certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
+if [[ "$RESOLVED_IP" == "$CURRENT_IP" ]]; then
+    log "DNS настроен верно. Запускаю Certbot..."
+    certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL" || warn "Certbot не смог получить сертификат."
+else
+    warn "ВНИМАНИЕ: Домен $DOMAIN указывает на $RESOLVED_IP, а должен на $CURRENT_IP."
+    warn "Certbot не сможет подтвердить домен. Создаю временный самоподписанный сертификат..."
+    
+    mkdir -p /etc/letsencrypt/live/"$DOMAIN"
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout /etc/letsencrypt/live/"$DOMAIN"/privkey.pem \
+        -out /etc/letsencrypt/live/"$DOMAIN"/fullchain.pem \
+        -subj "/CN=$DOMAIN"
+    log "Самоподписанный сертификат создан. Заглушка будет работать (с предупреждением в браузере)."
+fi
 
-if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
-    (crontab -l 2>/dev/null; echo "0 0,12 * * * certbot renew --quiet --post-hook 'systemctl reload nginx'") | crontab -
-    log "Задача на автопродление добавлена в crontab."
+# Настройка крона (только если сертификат от Let's Encrypt)
+if [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ] && [[ "$RESOLVED_IP" == "$CURRENT_IP" ]]; then
+    if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
+        (crontab -l 2>/dev/null; echo "0 0,12 * * * certbot renew --quiet --post-hook 'systemctl reload nginx'") | crontab -
+        log "Задача на автопродление добавлена."
+    fi
 fi
 
 #################################
