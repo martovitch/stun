@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+#################################
+# HELPERS & TRAP
+#################################
 trap 'echo -e "\033[1;31m[ERROR]\033[0m Ошибка в строке $LINENO"; exit 1' ERR
+
 log() { echo -e "\033[1;32m[INFO]\033[0m $1"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $1"; }
 die() { echo -e "\033[1;31m[ERROR]\033[0m $1"; exit 1; }
@@ -13,16 +17,22 @@ echo "==================================================="
 echo "    BRIDGE + NGINX SSL + BBR + AUTO-RENEW          "
 echo "==================================================="
 
+#################################
+# ВВОД ДАННЫХ
+#################################
 read -p "Введите ваш ДОМЕН: " DOMAIN
 read -p "Введите ваш EMAIL: " EMAIL
-read -p "Введите IP удаленного сервера: " REMOTE_IP
+read -p "Введите IP удаленного сервера (Destination): " REMOTE_IP
 read -p "Входящий порт для моста [8443]: " LOCAL_PORT
 LOCAL_PORT=${LOCAL_PORT:-8443}
 
-log "1. Установка пакетов..."
+log "1. Установка необходимых пакетов..."
 apt update -qq && apt install -y nginx certbot python3-certbot-nginx ufw cron curl dnsutils
 
-log "2. Активация BBR..."
+#################################
+# 2. АКТИВАЦИЯ BBR
+#################################
+log "2. Активация BBR и оптимизация..."
 cat <<EOF > /etc/sysctl.d/99-bridge-performance.conf
 net.ipv4.ip_forward = 1
 net.core.default_qdisc = fq
@@ -38,7 +48,10 @@ net.core.wmem_max = 16777216
 EOF
 sysctl --system >/dev/null
 
-log "3. Работа с SSL..."
+#################################
+# 3. РАБОТА С SSL
+#################################
+log "3. Проверка DNS и работа с SSL..."
 CURRENT_IP=$(curl -s -4 ifconfig.me || echo "unknown")
 RESOLVED_IP=$(dig +short "$DOMAIN" A | tail -n1)
 
@@ -46,13 +59,18 @@ ufw allow 80/tcp >/dev/null
 ufw allow 443/tcp >/dev/null
 
 if [[ "$RESOLVED_IP" == "$CURRENT_IP" ]]; then
-    certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL" || true
+    log "DNS совпадает. Получаем/обновляем SSL..."
+    # Используем || true чтобы скрипт не падал если сертификат уже есть
+    certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL" || warn "Certbot сообщил о наличии или ошибке, продолжаем..."
+    
     sleep 2
-    if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
-        (crontab -l 2>/dev/null; echo "0 0,12 * * * certbot renew --quiet --post-hook 'systemctl reload nginx'") | crontab -
+    # Безопасное добавление в Cron (исправлено)
+    if ! (crontab -l 2>/dev/null | grep -q "certbot renew"); then
+        (crontab -l 2>/dev/null || echo ""; echo "0 0,12 * * * certbot renew --quiet --post-hook 'systemctl reload nginx'") | crontab -
+        log "Автопродление добавлено."
     fi
 else
-    warn "Используем самоподписанный SSL (IP не совпали)"
+    warn "IP не совпадают. Создаем самоподписанный SSL..."
     mkdir -p /etc/letsencrypt/live/"$DOMAIN"
     openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
         -keyout /etc/letsencrypt/live/"$DOMAIN"/privkey.pem \
@@ -60,7 +78,10 @@ else
         -subj "/CN=$DOMAIN" || true
 fi
 
-log "4. Настройка Nginx..."
+#################################
+# 4. НАСТРОЙКА NGINX
+#################################
+log "4. Настройка Nginx заглушки..."
 cat <<EOF > /etc/nginx/sites-available/default
 server {
     listen 80;
@@ -78,9 +99,13 @@ server {
     location / { try_files \$uri \$uri/ =404; }
 }
 EOF
+echo "<html><body style='background:#000;color:#222;text-align:center;padding-top:20%;'><h1>Server Online</h1></body></html>" > /var/www/html/index.html
 systemctl restart nginx
 
-log "5. Настройка моста..."
+#################################
+# 5. НАСТРОЙКА МОСТА (NAT)
+#################################
+log "5. Настройка моста :$LOCAL_PORT -> $REMOTE_IP:443..."
 LOCAL_IP4=$(hostname -I | awk '{print $1}')
 cp /etc/ufw/before.rules /etc/ufw/before.rules.bak
 sed -i '/\*nat/,/COMMIT/d' /etc/ufw/before.rules
@@ -104,4 +129,8 @@ ufw allow "$LOCAL_PORT"/udp
 ufw --force enable
 ufw reload
 
+echo "---------------------------------------------------"
 log "УСПЕШНО ЗАВЕРШЕНО"
+echo "Домен: https://$DOMAIN"
+echo "Мост: :$LOCAL_PORT -> $REMOTE_IP:443"
+echo "---------------------------------------------------"
